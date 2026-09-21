@@ -1,0 +1,40 @@
+# Redis + K8s View Counter — Project Plan
+
+## Context
+Learning/portfolio project to practice Postgres, Redis and beginner Kubernetes (minikube) together, aimed at backend/system-design interviews. Domain: a view counter / analytics service where each technology has a distinct job. Working style: Socratic, small steps with check-ins; Claude writes files, the user runs commands.
+
+## Locked-in decisions
+- **Dominant constraint (user-redefined):** an ACKed view may be lost only within ~1s of a Redis crash, never otherwise. ACK (HTTP 202) is sent only after Redis confirms the write.
+- **View model:** event = `(resource_id, timestamp)`; counted per resource per UTC hour bucket. No raw event table. Unique/per-user views out of scope (possible later HyperLogLog extension).
+- **Redis:** write buffer (not a cache). Key `views:{resource_id}:{YYYYMMDDHH}` via `INCR`. AOF on, `appendfsync everysec`, data on a persistent volume.
+- **Buffer's value:** aggregation. N views on a hot key become one Postgres write per drain (avoids hot-row lock contention and MVCC bloat).
+- **Postgres:** durable source of truth. `view_counts(resource_id, bucket_start, count)` PK `(resource_id, bucket_start)`; `applied_batches(batch_id PK)`.
+- **Drain (Redis to Postgres):** atomic `RENAME` to `draining:<batch_id>`, then one Postgres transaction that inserts `batch_id` into `applied_batches` and upserts `count = count + N`, then `DEL` the renamed key. Startup recovery drains leftover `draining:*` keys. Avoids lost increments (GET/DEL race) and double counting (crash between commit and DEL).
+- **Drain trigger (proposed, open to challenge):** time-based, every 5–10s, configurable via env/ConfigMap.
+- **API:** FastAPI. `POST /views` (write), `GET /views/{resource_id}` (read, Postgres only at first, so it lags by up to one drain interval), health endpoints for probes.
+- **K8s scope:** minikube (Docker driver), pods/deployments/services/configmaps/probes. Out of scope: multi-node, cloud, autoscaling.
+
+## Stages (each ends with a check-in; no jumping ahead)
+1. **Write path.** Files already exist: `docker-compose.yml` (Redis with AOF everysec + volume, Postgres) and `src/redis_k8s_view_counter/app.py` (`POST /views`). Run `uv add fastapi "uvicorn[standard]" redis`, `docker compose up -d`, start uvicorn, curl, inspect keys with `redis-cli`, then `docker compose restart redis` and confirm the counter survives.
+2. **Postgres + read endpoint.** Add `psycopg` (async). Create tables on startup (`CREATE TABLE IF NOT EXISTS`). Add `GET /views/{resource_id}?hours=24` reading from Postgres. Decide together: bucket-range query shape.
+3. **Drain worker.** Separate entry point (`worker.py`, same image, later its own Deployment) running the RENAME, apply, DEL loop plus startup recovery. Discuss: why separate from the API replicas (RENAME makes it safe either way, but separation is cleaner).
+4. **Failure testing.** Kill the worker mid-batch and confirm no double count. Kill Redis and measure the actual loss window under `everysec`. Confirm ACKed views are otherwise accounted for.
+5. **Benchmark.** Throwaway `/views/direct` (direct Postgres `UPDATE`) vs buffered `/views`, hot-key load (script or `hey`). Compare write latency and read freshness before/after a drain.
+6. **Containerize.** `Dockerfile` (uv, Python 3.14-compatible base image) and `.dockerignore`. One image for API and worker.
+7. **Minikube.** `minikube start --driver=docker`, load the image. Manifests: ConfigMap (Redis URL, drain interval, non-secret settings), Secret for the Postgres password, Deployments for api and worker, Redis and Postgres as StatefulSets with PVCs (Redis PVC is required so the AOF survives pod recreation), Services. Probes: liveness `/healthz`, readiness `/readyz` (checks Redis ping). Exercises: delete pods and watch recovery, confirm the counter survives a Redis pod restart.
+8. **Wrap-up.** README with architecture diagram, decision log and tradeoffs, and interview talking points (write buffer vs cache, at-least-once + idempotency, durability vs latency, hot-key contention).
+
+## Open questions to revisit in-stage
+- Drain interval value, and drain trigger (time vs hybrid) if the user wants to challenge it.
+- Read semantics: Postgres only vs Postgres + pending Redis counts (freshness tradeoff).
+- Whether the worker is a separate process (recommended) or a background task in the API.
+
+## Critical files
+- `docker-compose.yml`, `src/redis_k8s_view_counter/app.py` (exist)
+- New: `src/redis_k8s_view_counter/{db.py, worker.py}`, `Dockerfile`, `k8s/*.yaml`, `README.md`
+
+## Verification (end to end)
+- Local: POST views, drain, and `GET /views/...` returns the right total after a drain.
+- Idempotency: kill worker between Postgres commit and DEL, restart, and the total is unchanged.
+- Durability: `docker compose restart redis` and the counter survives (AOF).
+- K8s: `kubectl get pods` all Ready, delete each pod and it recovers, `minikube service` reaches the API, counts survive a Redis pod restart.
