@@ -7,7 +7,11 @@ authors = [
     { name = "Avichai", email = "@" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "fastapi>=0.141.1",
+    "redis>=8.1.0",
+    "uvicorn[standard]>=0.54.0",
+]
 
 [project.scripts]
 redis-k8s-view-counter = "redis_k8s_view_counter:main"

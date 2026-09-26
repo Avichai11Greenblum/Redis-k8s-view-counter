@@ -16,7 +16,7 @@ from redis.asyncio import Redis
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
 
-class ViewEvent(BaseModel):
+class EventView(BaseModel):
     """Request body for POST /views."""
 
     resource_id: str
@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-def bucket_key(resource_id: str, now: datetime) -> str:
+def get_bucket_key(resource_id: str, now: datetime) -> str:
     """Build the Redis counter key, e.g. `views:post:42:2026092114`.
 
     The last segment is the fixed-width UTC hour bucket (YYYYMMDDHH), so the
@@ -48,13 +48,13 @@ def bucket_key(resource_id: str, now: datetime) -> str:
 
 
 @app.post("/views", status_code=status.HTTP_202_ACCEPTED)
-async def record_view(event: ViewEvent):
+async def record_view(event: EventView):
     """Record one view by incrementing its hourly counter in Redis.
 
     Returns 202 only after Redis has answered the INCR, so an ACKed view is
     never one Redis hasn't seen. Durability after that point comes from Redis
     AOF (appendfsync everysec), which can lose up to ~1s on a crash.
     """
-    key = bucket_key(event.resource_id, datetime.now(timezone.utc))
+    key = get_bucket_key(event.resource_id, datetime.now(timezone.utc))
     await app.state.redis.incr(key)
     return {"key": key}
