@@ -1,60 +1,70 @@
-"""View counter API: the write path.
+"""View counter API: write path (Redis) and read path (Postgres).
 
 Each view is recorded as an INCR on a Redis counter keyed by resource and UTC
-hour bucket. Redis is a write buffer: counts are drained to Postgres in batches
-by a separate worker, so this service never writes to Postgres per view.
+minute bucket. Redis is a write buffer: counts are drained to Postgres in
+batches by a separate worker (stage 3), so this service never writes to
+Postgres per view. Reads, for now, go straight to Postgres, so they lag
+behind the write path by up to one drain interval.
 """
 
-import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, status
-from pydantic import BaseModel
-from redis.asyncio import Redis
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-
-
-class EventView(BaseModel):
-    """Request body for POST /views."""
-
-    resource_id: str
+from .db import get_db_pool, get_view_buckets, init_tables
+from .redis_store import get_redis_client, increment_view
+from .schemas import EventView, ViewBucket, ViewsResponse
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Open one shared Redis client at startup and close it at shutdown.
+    """Open the Redis client and Postgres pool at startup, close at shutdown.
 
     Code before `yield` runs once when the app starts, code after it runs once
-    when the app stops. The client is kept on `app.state` so every request
-    reuses the same connection pool.
+    when the app stops. Both clients live on `app.state` so every request
+    reuses the same connections.
     """
-    app.state.redis = Redis.from_url(REDIS_URL, decode_responses=True)
+    app.state.redis = get_redis_client()
+
+    app.state.db_pool = get_db_pool()
+    await app.state.db_pool.open()
+    await init_tables(app.state.db_pool)
+
     yield
+
     await app.state.redis.aclose()
+    await app.state.db_pool.close()
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-def get_bucket_key(resource_id: str, now: datetime) -> str:
-    """Build the Redis counter key, e.g. `views:post:42:2026092114`.
-
-    The last segment is the fixed-width UTC hour bucket (YYYYMMDDHH), so the
-    key can be split from the right even if `resource_id` contains colons.
-    """
-    return f"views:{resource_id}:{now:%Y%m%d%H}"
-
-
 @app.post("/views", status_code=status.HTTP_202_ACCEPTED)
 async def record_view(event: EventView):
-    """Record one view by incrementing its hourly counter in Redis.
+    """Record one view by incrementing its minute counter in Redis.
 
     Returns 202 only after Redis has answered the INCR, so an ACKed view is
     never one Redis hasn't seen. Durability after that point comes from Redis
     AOF (appendfsync everysec), which can lose up to ~1s on a crash.
     """
-    key = get_bucket_key(event.resource_id, datetime.now(timezone.utc))
-    await app.state.redis.incr(key)
+    key = await increment_view(app.state.redis, event.resource_id)
     return {"key": key}
+
+
+@app.get("/views/{resource_id}", response_model=ViewsResponse)
+async def read_views_from_db(resource_id: str, hours: int = 24):
+    """Return per-minute view counts for a resource from Postgres.
+
+    This only sees counts that a drain has already applied, so it lags behind
+    the write path by up to one drain interval — it does not read Redis.
+    """
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    rows = await get_view_buckets(app.state.db_pool, resource_id, since)
+    buckets = [ViewBucket(bucket_start=bucket_start, count=count) for bucket_start, count in rows]
+    return ViewsResponse(
+        resource_id=resource_id,
+        since=since,
+        total=sum(bucket.count for bucket in buckets),
+        buckets=buckets,
+    )
