@@ -5,17 +5,17 @@ Learning/portfolio project to practice Postgres, Redis and beginner Kubernetes (
 
 ## Locked-in decisions
 - **Dominant constraint (user-redefined):** an ACKed view may be lost only within ~1s of a Redis crash, never otherwise. ACK (HTTP 202) is sent only after Redis confirms the write.
-- **View model:** event = `(resource_id, timestamp)`; counted per resource per UTC hour bucket. No raw event table. Unique/per-user views out of scope (possible later HyperLogLog extension).
-- **Redis:** write buffer (not a cache). Key `views:{resource_id}:{YYYYMMDDHH}` via `INCR`. AOF on, `appendfsync everysec`, data on a persistent volume.
-- **Buffer's value:** aggregation. N views on a hot key become one Postgres write per drain (avoids hot-row lock contention and MVCC bloat).
-- **Postgres:** durable source of truth. `view_counts(resource_id, bucket_start, count)` PK `(resource_id, bucket_start)`; `applied_batches(batch_id PK)`.
+- **View model:** event = `(resource_id, timestamp)`; counted per resource per UTC **minute** bucket (changed from hour — fine granularity lets trends show up live while draining, and aggregated per-bucket rows already form a timeline on their own, so no raw event table is needed). Unique/per-user views out of scope (possible later HyperLogLog extension).
+- **Redis:** write buffer (not a cache). Key `views:{resource_id}:{YYYYMMDDHHMM}` via `INCR`. AOF on, `appendfsync everysec`, data on a persistent volume.
+- **Buffer's value:** aggregation. N views on a hot key become one Postgres write per drain (avoids hot-row lock contention and MVCC bloat). A bucket can be drained multiple times while still open (RENAME takes whatever accumulated so far); Postgres accumulates via `count = count + N`, so counts stay correct and visibly climb while a minute is still in progress.
+- **Postgres:** durable source of truth. `view_counts(resource_id TEXT, bucket_start TIMESTAMPTZ, count BIGINT)` PK `(resource_id, bucket_start)`; `applied_batches(batch_id PK)`. `TIMESTAMPTZ` (not a formatted string) so range queries like "last 24h" are native. `TEXT` for `resource_id` (Postgres treats `TEXT`/`VARCHAR(n)` identically; no DB-enforced length cap for now).
 - **Drain (Redis to Postgres):** atomic `RENAME` to `draining:<batch_id>`, then one Postgres transaction that inserts `batch_id` into `applied_batches` and upserts `count = count + N`, then `DEL` the renamed key. Startup recovery drains leftover `draining:*` keys. Avoids lost increments (GET/DEL race) and double counting (crash between commit and DEL).
 - **Drain trigger (proposed, open to challenge):** time-based, every 5–10s, configurable via env/ConfigMap.
 - **API:** FastAPI. `POST /views` (write), `GET /views/{resource_id}` (read, Postgres only at first, so it lags by up to one drain interval), health endpoints for probes.
 - **K8s scope:** minikube (Docker driver), pods/deployments/services/configmaps/probes. Out of scope: multi-node, cloud, autoscaling.
 
 ## Stages (each ends with a check-in; no jumping ahead)
-1. **Write path.** Files already exist: `docker-compose.yml` (Redis with AOF everysec + volume, Postgres) and `src/redis_k8s_view_counter/app.py` (`POST /views`). Run `uv add fastapi "uvicorn[standard]" redis`, `docker compose up -d`, start uvicorn, curl, inspect keys with `redis-cli`, then `docker compose restart redis` and confirm the counter survives.
+1. **Write path — done.** `docker-compose.yml` (Redis with AOF everysec + volume, Postgres) and the app, split into `app.py` (FastAPI wiring: `lifespan`, `POST /views`), `redis_store.py` (`get_redis_client`, `get_bucket_key`, `increment_view`), `schemas.py` (`EventView`). Verified: writes increment the right key, and a hard kill (`docker compose kill redis`) followed by restart loses nothing, confirming AOF `everysec` durability.
 2. **Postgres + read endpoint.** Add `psycopg` (async). Create tables on startup (`CREATE TABLE IF NOT EXISTS`). Add `GET /views/{resource_id}?hours=24` reading from Postgres. Decide together: bucket-range query shape.
 3. **Drain worker.** Separate entry point (`worker.py`, same image, later its own Deployment) running the RENAME, apply, DEL loop plus startup recovery. Discuss: why separate from the API replicas (RENAME makes it safe either way, but separation is cleaner).
 4. **Failure testing.** Kill the worker mid-batch and confirm no double count. Kill Redis and measure the actual loss window under `everysec`. Confirm ACKed views are otherwise accounted for.
@@ -30,7 +30,7 @@ Learning/portfolio project to practice Postgres, Redis and beginner Kubernetes (
 - Whether the worker is a separate process (recommended) or a background task in the API.
 
 ## Critical files
-- `docker-compose.yml`, `src/redis_k8s_view_counter/app.py` (exist)
+- `docker-compose.yml`, `src/redis_k8s_view_counter/{app.py, redis_store.py, schemas.py}` (exist)
 - New: `src/redis_k8s_view_counter/{db.py, worker.py}`, `Dockerfile`, `k8s/*.yaml`, `README.md`
 
 ## Verification (end to end)
