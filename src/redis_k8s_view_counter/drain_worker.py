@@ -22,6 +22,7 @@ import uuid
 
 from psycopg_pool import AsyncConnectionPool
 from redis.asyncio import Redis
+from redis.exceptions import ResponseError
 
 from .db import apply_batch, get_db_pool, init_tables
 from .redis_store import (
@@ -40,11 +41,34 @@ logger = logging.getLogger(__name__)
 
 
 async def drain_key(redis: Redis, pool: AsyncConnectionPool, raw_key: str) -> None:
-    """Drain a single live counter key (views:...) to Postgres."""
-    bucket_key = BucketKey.from_redis_key(raw_key)
+    """Drain a single live counter key (views:...) to Postgres.
+
+    If another worker (a second replica, later, in K8s) already renamed this
+    same key away between our SCAN and this RENAME, Redis raises "no such
+    key". That's not a bug — it just means we lost the race for this one key,
+    and the other worker now owns draining it. We skip it and move on.
+    """
+    try:
+        bucket_key = BucketKey.from_redis_key(raw_key)
+    except ValueError:
+        # Not a race, not ours to drain — e.g. a leftover key from an old
+        # key format that can never parse correctly. Nothing to apply, so
+        # the only sane move is to remove it; otherwise it blocks every
+        # future drain cycle forever.
+        logger.warning("deleting unparseable key %s", raw_key)
+        await redis.delete(raw_key)
+        return
+
     draining_key = bucket_key.draining_key(uuid.uuid4().hex)
 
-    await redis.rename(str(bucket_key), str(draining_key))
+    try:
+        await redis.rename(str(bucket_key), str(draining_key))
+    except ResponseError as exc:
+        if "no such key" in str(exc):
+            logger.info("skipped %s, already claimed by another worker", bucket_key)
+            return
+        raise
+
     await apply_batch_and_delete(redis, pool, draining_key)
 
 

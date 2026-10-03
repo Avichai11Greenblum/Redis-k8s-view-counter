@@ -19,6 +19,25 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 VIEW_KEY_PREFIX = "views"
 DRAINING_KEY_PREFIX = "draining"
 BUCKET_FORMAT = "%Y%m%d%H%M"
+BUCKET_LENGTH = len("202609211407")  # fixed-width YYYYMMDDHHMM, always 12 digits
+
+
+def _parse_bucket_str(bucket_str: str) -> datetime:
+    """Strictly parse a YYYYMMDDHHMM segment.
+
+    strptime alone isn't strict enough here: given a string shorter than the
+    format expects, it can still find *some* valid interpretation by letting
+    an earlier field (like %m) match fewer digits than normal — silently
+    producing a wrong-but-plausible datetime instead of an error. That's how
+    a leftover key from the old hour-only format (10 digits) used to get
+    misparsed instead of rejected. Checking the length up front closes that.
+    """
+    if len(bucket_str) != BUCKET_LENGTH:
+        raise ValueError(
+            f"bucket segment {bucket_str!r} is not {BUCKET_LENGTH} digits "
+            "(YYYYMMDDHHMM) — likely a stale key from an old key format"
+        )
+    return datetime.strptime(bucket_str, BUCKET_FORMAT).replace(tzinfo=timezone.utc)
 
 
 def get_redis_client() -> Redis:
@@ -52,8 +71,7 @@ class BucketKey:
         """Parse a `views:...` Redis key back into a BucketKey."""
         rest = key.removeprefix(f"{VIEW_KEY_PREFIX}:")
         resource_id, bucket_str = rest.rsplit(":", 1)
-        bucket_start = datetime.strptime(bucket_str, BUCKET_FORMAT).replace(tzinfo=timezone.utc)
-        return cls(resource_id, bucket_start)
+        return cls(resource_id, _parse_bucket_str(bucket_str))
 
     def draining_key(self, batch_id: str) -> "DrainingKey":
         """Build the DrainingKey this bucket moves to while being drained."""
@@ -91,8 +109,7 @@ class DrainingKey:
         """
         rest = key.removeprefix(f"{DRAINING_KEY_PREFIX}:")
         resource_id, bucket_str, batch_id = rest.rsplit(":", 2)
-        bucket_start = datetime.strptime(bucket_str, BUCKET_FORMAT).replace(tzinfo=timezone.utc)
-        return cls(resource_id, bucket_start, batch_id)
+        return cls(resource_id, _parse_bucket_str(bucket_str), batch_id)
 
 
 async def increment_view(redis: Redis, resource_id: str) -> str:
