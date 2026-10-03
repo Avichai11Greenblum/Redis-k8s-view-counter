@@ -9,6 +9,7 @@ point a crash would have interrupted them. The question these tests answer
 is: given that leftover state, does recovery behave correctly?
 """
 
+import uuid
 from datetime import datetime, timezone
 
 from redis_k8s_view_counter.db import apply_batch, get_view_buckets
@@ -22,10 +23,11 @@ async def total_count(db_pool, resource_id: str) -> int:
     return sum(count for _, count in rows)
 
 
-async def test_apply_batch_is_idempotent(db_pool, resource_id):
+async def test_apply_batch_is_idempotent(db_pool, resource_id, batch_ids):
     """Applying the same batch_id twice must only ever count once."""
     bucket_start = datetime.now(timezone.utc)
-    batch_id = f"{resource_id}:idem"
+    batch_id = uuid.uuid4().hex
+    batch_ids.append(batch_id)
 
     first = await apply_batch(db_pool, batch_id, resource_id, bucket_start, 5)
     second = await apply_batch(db_pool, batch_id, resource_id, bucket_start, 5)
@@ -35,7 +37,7 @@ async def test_apply_batch_is_idempotent(db_pool, resource_id):
     assert await total_count(db_pool, resource_id) == 5  # not 10
 
 
-async def test_recover_pending_resumes_a_crash_before_delete(redis_client, db_pool, resource_id):
+async def test_recover_pending_resumes_a_crash_before_delete(redis_client, db_pool, resource_id, batch_ids):
     """The scenario stage 4 exists to prove: a worker that committed to
     Postgres but crashed before deleting the draining:* key. On restart,
     recover_pending must finish the batch without double-counting.
@@ -46,8 +48,10 @@ async def test_recover_pending_resumes_a_crash_before_delete(redis_client, db_po
 
     # This reproduces what drain_key does, but stops short of the final
     # DEL — that gap IS "the crash," made reproducible instead of a real
-    # kill -9 timed by hand.
-    draining_key = bucket_key.draining_key(f"{resource_id}:crash")
+    # kill -9 timed by hand. batch_id mirrors production (uuid4().hex, no
+    # colons) — DrainingKey parsing relies on batch_id being colon-free.
+    draining_key = bucket_key.draining_key(uuid.uuid4().hex)
+    batch_ids.append(draining_key.batch_id)
     await redis_client.rename(str(bucket_key), str(draining_key))
     await apply_batch(
         db_pool, draining_key.batch_id, draining_key.resource_id, draining_key.bucket_start, 2
@@ -86,4 +90,19 @@ async def test_drain_key_deletes_unparseable_legacy_keys(redis_client, db_pool):
 
     await drain_key(redis_client, db_pool, raw_key)
 
+    assert not await redis_client.exists(raw_key)
+
+
+async def test_recover_pending_deletes_unparseable_draining_keys(redis_client, db_pool):
+    """Regression test for a gap recover_pending had (found while fixing the
+    tests above): one malformed draining:* key used to abort recovery for
+    *every* pending batch found in the same scan, since the loop had no
+    try/except around the parse and would raise straight out of it.
+    """
+    raw_key = "draining:pytest-legacy-key:2026092609:deadbeef"  # 10-digit bucket, old format
+    await redis_client.set(raw_key, 1)
+
+    recovered = await recover_pending(redis_client, db_pool)
+
+    assert recovered == 1
     assert not await redis_client.exists(raw_key)

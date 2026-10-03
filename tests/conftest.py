@@ -41,15 +41,24 @@ def resource_id() -> str:
     return f"pytest:{uuid.uuid4().hex}"
 
 
-@pytest_asyncio.fixture(autouse=True)
-async def cleanup_test_rows(db_pool, resource_id):
-    """Remove whatever this test wrote, keyed off its unique resource_id.
+@pytest.fixture
+def batch_ids() -> list[str]:
+    """Tests append any batch_id they create here; cleaned up exactly below.
 
-    Every batch_id used in these tests is prefixed with resource_id, so one
-    LIKE pattern cleans up applied_batches too, regardless of which test
-    actually created rows.
+    Deliberately exact-match cleanup, not a LIKE pattern keyed off
+    resource_id: batch_id must never contain a colon (DrainingKey parsing
+    relies on that), and resource_id here does contain one (`pytest:...`),
+    so building one from the other is exactly the trap one of these tests
+    exists to avoid.
     """
+    return []
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def cleanup_test_rows(db_pool, resource_id, batch_ids):
+    """Remove whatever this test wrote."""
     yield
     async with db_pool.connection() as conn:
         await conn.execute("DELETE FROM view_counts WHERE resource_id = %s", (resource_id,))
-        await conn.execute("DELETE FROM applied_batches WHERE batch_id LIKE %s", (f"{resource_id}%",))
+        for batch_id in batch_ids:
+            await conn.execute("DELETE FROM applied_batches WHERE batch_id = %s", (batch_id,))

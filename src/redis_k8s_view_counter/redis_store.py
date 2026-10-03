@@ -86,6 +86,11 @@ class DrainingKey:
     bucket), so draining the same still-open bucket twice in a row produces
     two distinct keys/batches, never a collision.
 
+    batch_id must never itself contain a colon: from_redis_key below finds
+    the bucket and batch_id by splitting from the right, so a colon inside
+    batch_id would be mistaken for one of those split points. uuid4().hex
+    (used everywhere this is actually constructed) is always colon-free.
+
     Examples:
         >>> str(DrainingKey("post:42", datetime(2026, 9, 21, 14, 7, tzinfo=timezone.utc), "a1b2c3"))
         'draining:post:42:202609211407:a1b2c3'

@@ -104,7 +104,17 @@ async def recover_pending(redis: Redis, pool: AsyncConnectionPool) -> int:
     """
     raw_keys = await scan_keys(redis, DRAINING_KEY_PREFIX)
     for raw_key in raw_keys:
-        await apply_batch_and_delete(redis, pool, DrainingKey.from_redis_key(raw_key))
+        try:
+            draining_key = DrainingKey.from_redis_key(raw_key)
+        except ValueError:
+            # Same reasoning as drain_key's unparseable-key handling: nothing
+            # to recover from a key we can't even parse. Without this, one
+            # bad leftover key would abort recovery for every other pending
+            # batch too, since this loop would raise straight out of it.
+            logger.warning("deleting unparseable key %s", raw_key)
+            await redis.delete(raw_key)
+            continue
+        await apply_batch_and_delete(redis, pool, draining_key)
     if raw_keys:
         logger.info("recovered %d pending batch(es) from a previous run", len(raw_keys))
     return len(raw_keys)
