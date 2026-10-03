@@ -28,6 +28,22 @@ CREATE TABLE IF NOT EXISTS applied_batches (
 );
 """
 
+# Step 1 of apply_batch: claim this batch_id.
+INSERT_APPLIED_BATCH_SQL = (
+    "INSERT INTO applied_batches (batch_id) VALUES (%s) "
+    "ON CONFLICT DO NOTHING RETURNING batch_id"
+)
+
+# Step 2 of apply_batch: add this batch's count onto the bucket's running
+# total. ON CONFLICT triggers if the row (resource_id, bucket_start) 
+# already exists.
+UPSERT_VIEW_COUNT_SQL = """
+INSERT INTO view_counts (resource_id, bucket_start, count)
+VALUES (%s, %s, %s)
+ON CONFLICT (resource_id, bucket_start)
+DO UPDATE SET count = view_counts.count + EXCLUDED.count
+"""
+
 
 def get_db_pool() -> AsyncConnectionPool:
     """Build a connection pool from DATABASE_URL.
@@ -42,6 +58,34 @@ async def init_tables(pool: AsyncConnectionPool) -> None:
     """Create the tables if they don't already exist."""
     async with pool.connection() as conn:
         await conn.execute(CREATE_TABLES_SQL)
+
+
+async def apply_batch(
+    pool: AsyncConnectionPool,
+    batch_id: str,
+    resource_id: str,
+    bucket_start: datetime,
+    count: int,
+) -> bool:
+    """Apply one drained batch to view_counts, exactly once, ever.
+
+    ***`INSERT ... ON CONFLICT DO NOTHING RETURNING` is the idempotency*** check: if
+    batch_id is already in applied_batches, the insert is skipped, no row
+    comes back, and we know not to add `count` again. Both statements run in
+    one transaction, so "batch recorded" and "count applied" can't split —
+    the caller is safe to retry (e.g. after a crash) and this is a no-op.
+
+    Returns True if this call actually applied the count, False if the batch
+    had already been applied by an earlier (or interrupted) attempt.
+    """
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            cur = await conn.execute(INSERT_APPLIED_BATCH_SQL, (batch_id,))
+            if await cur.fetchone() is None:
+                return False  # already applied by a previous attempt — that's the idempotency check.
+
+            await conn.execute(UPSERT_VIEW_COUNT_SQL, (resource_id, bucket_start, count))
+            return True
 
 
 async def get_view_buckets(

@@ -18,22 +18,22 @@ def get_redis_client() -> Redis:
 
 
 def get_bucket_key(resource_id: str, now: datetime) -> str:
-    """Build the Redis counter key, e.g. `views:post:42:2026092114`.
+    """Build the Redis counter key, e.g. `views:post:42:202609211407`.
 
-    The last segment is the fixed-width UTC hour bucket (YYYYMMDDHH), so the
-    key can be split from the right even if `resource_id` contains colons.
+    The last segment is the fixed-width UTC minute bucket (YYYYMMDDHHMM), so
+    the key can be split from the right even if `resource_id` contains colons.
 
     Examples:
         >>> get_bucket_key("post:42", datetime(2026, 9, 21, 14, 7, tzinfo=timezone.utc))
-        'views:post:42:2026092114'
+        'views:post:42:202609211407'
         >>> get_bucket_key("blog/redis-intro", datetime(2026, 1, 3, 9, 0, tzinfo=timezone.utc))
-        'views:blog/redis-intro:2026010309'
+        'views:blog/redis-intro:202601030900'
     """
-    return f"views:{resource_id}:{now:%Y%m%d%H}"
+    return f"views:{resource_id}:{now:%Y%m%d%H%M}"
 
 
 async def increment_view(redis: Redis, resource_id: str) -> str:
-    """Record one view by incrementing its hourly counter in Redis.
+    """Record one view by incrementing its minute counter in Redis.
 
     Returns the key that was incremented, once Redis has confirmed the write.
     """
