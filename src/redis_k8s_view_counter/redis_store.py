@@ -1,15 +1,24 @@
-"""Redis write-buffer logic: key layout and the INCR call.
+"""Redis write-buffer logic: key layout, the INCR call, and drain support.
 
 No FastAPI here. Everything in this file is plain Redis logic that could be
-unit-tested or reused (e.g. by the future drain worker) without the web layer.
+unit-tested or reused by the API and the drain worker alike.
+
+Two key shapes live here, each as its own value object:
+  BucketKey   -> views:{resource_id}:{YYYYMMDDHHMM}              (live, growing counter)
+  DrainingKey -> draining:{resource_id}:{YYYYMMDDHHMM}:{batch_id} (frozen, mid-drain)
 """
 
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from redis.asyncio import Redis
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+
+VIEW_KEY_PREFIX = "views"
+DRAINING_KEY_PREFIX = "draining"
+BUCKET_FORMAT = "%Y%m%d%H%M"
 
 
 def get_redis_client() -> Redis:
@@ -17,19 +26,73 @@ def get_redis_client() -> Redis:
     return Redis.from_url(REDIS_URL, decode_responses=True)
 
 
-def get_bucket_key(resource_id: str, now: datetime) -> str:
-    """Build the Redis counter key, e.g. `views:post:42:202609211407`.
+@dataclass(frozen=True)
+class BucketKey:
+    """A live, growing view counter for one resource and one minute bucket.
 
-    The last segment is the fixed-width UTC minute bucket (YYYYMMDDHHMM), so
-    the key can be split from the right even if `resource_id` contains colons.
+    str(key) gives the Redis key, e.g. `views:post:42:202609211407`. The
+    bucket is a fixed-width trailing segment, so resource_id may itself
+    contain colons without breaking the parse.
 
     Examples:
-        >>> get_bucket_key("post:42", datetime(2026, 9, 21, 14, 7, tzinfo=timezone.utc))
+        >>> str(BucketKey("post:42", datetime(2026, 9, 21, 14, 7, tzinfo=timezone.utc)))
         'views:post:42:202609211407'
-        >>> get_bucket_key("blog/redis-intro", datetime(2026, 1, 3, 9, 0, tzinfo=timezone.utc))
-        'views:blog/redis-intro:202601030900'
+        >>> BucketKey.from_redis_key("views:post:42:202609211407")
+        BucketKey(resource_id='post:42', bucket_start=datetime.datetime(2026, 9, 21, 14, 7, tzinfo=datetime.timezone.utc))
     """
-    return f"views:{resource_id}:{now:%Y%m%d%H%M}"
+
+    resource_id: str
+    bucket_start: datetime
+
+    def __str__(self) -> str:
+        return f"{VIEW_KEY_PREFIX}:{self.resource_id}:{self.bucket_start:{BUCKET_FORMAT}}"
+
+    @classmethod
+    def from_redis_key(cls, key: str) -> "BucketKey":
+        """Parse a `views:...` Redis key back into a BucketKey."""
+        rest = key.removeprefix(f"{VIEW_KEY_PREFIX}:")
+        resource_id, bucket_str = rest.rsplit(":", 1)
+        bucket_start = datetime.strptime(bucket_str, BUCKET_FORMAT).replace(tzinfo=timezone.utc)
+        return cls(resource_id, bucket_start)
+
+    def draining_key(self, batch_id: str) -> "DrainingKey":
+        """Build the DrainingKey this bucket moves to while being drained."""
+        return DrainingKey(self.resource_id, self.bucket_start, batch_id)
+
+
+@dataclass(frozen=True)
+class DrainingKey:
+    """A view counter frozen mid-drain, on its way to Postgres.
+
+    batch_id is a fresh id per drain attempt (not derived from resource or
+    bucket), so draining the same still-open bucket twice in a row produces
+    two distinct keys/batches, never a collision.
+
+    Examples:
+        >>> str(DrainingKey("post:42", datetime(2026, 9, 21, 14, 7, tzinfo=timezone.utc), "a1b2c3"))
+        'draining:post:42:202609211407:a1b2c3'
+        >>> DrainingKey.from_redis_key("draining:page:count_example:202601030900:f00d")
+        DrainingKey(resource_id='page:count_example', bucket_start=datetime.datetime(2026, 1, 3, 9, 0, tzinfo=datetime.timezone.utc), batch_id='f00d')
+    """
+
+    resource_id: str
+    bucket_start: datetime
+    batch_id: str
+
+    def __str__(self) -> str:
+        return f"{DRAINING_KEY_PREFIX}:{self.resource_id}:{self.bucket_start:{BUCKET_FORMAT}}:{self.batch_id}"
+
+    @classmethod
+    def from_redis_key(cls, key: str) -> "DrainingKey":
+        """Parse a `draining:...` Redis key back into a DrainingKey.
+
+        Parsed from the right: batch_id is always the last segment, the
+        bucket is the one before it, and everything remaining is resource_id.
+        """
+        rest = key.removeprefix(f"{DRAINING_KEY_PREFIX}:")
+        resource_id, bucket_str, batch_id = rest.rsplit(":", 2)
+        bucket_start = datetime.strptime(bucket_str, BUCKET_FORMAT).replace(tzinfo=timezone.utc)
+        return cls(resource_id, bucket_start, batch_id)
 
 
 async def increment_view(redis: Redis, resource_id: str) -> str:
@@ -37,6 +100,17 @@ async def increment_view(redis: Redis, resource_id: str) -> str:
 
     Returns the key that was incremented, once Redis has confirmed the write.
     """
-    key = get_bucket_key(resource_id, datetime.now(timezone.utc))
-    await redis.incr(key)
-    return key
+    key = BucketKey(resource_id, datetime.now(timezone.utc))
+    await redis.incr(str(key))
+    return str(key)
+
+
+async def scan_keys(redis: Redis, prefix: str) -> list[str]:
+    """List every key under a prefix using SCAN, not KEYS.
+
+    KEYS walks the whole keyspace in one blocking call, freezing Redis for
+    every other client until it finishes — a real problem at scale. SCAN
+    walks it incrementally via a cursor, so normal traffic (our INCRs) isn't
+    blocked while the worker looks for keys to drain.
+    """
+    return [key async for key in redis.scan_iter(match=f"{prefix}:*")]
