@@ -30,8 +30,11 @@ Learning/portfolio project to practice Postgres, Redis and beginner Kubernetes (
 - Whether the worker is a separate process (recommended) or a background task in the API.
 
 ## Critical files
-- `docker-compose.yml`, `src/redis_k8s_view_counter/{app.py, redis_store.py, schemas.py}` (exist)
-- New: `src/redis_k8s_view_counter/{db.py, drain_worker.py}`, `Dockerfile`, `k8s/*.yaml`, `README.md`
+- `docker-compose.yml`, `src/redis_k8s_view_counter/{app.py, redis_store.py, schemas.py, db.py, drain_worker.py}`, `tests/`, `.github/workflows/tests.yml` (exist)
+- New: `Dockerfile`, `k8s/*.yaml`, `README.md`
+
+## CI
+`.github/workflows/tests.yml` runs `tests/` on every push/PR, with Redis and Postgres as GitHub Actions service containers (mirrors docker-compose). Uses `uv sync --locked --all-groups` so CI installs exactly what `uv.lock` pins.
 
 ## Verification (end to end)
 - Local: POST views, drain, and `GET /views/...` returns the right total after a drain.
