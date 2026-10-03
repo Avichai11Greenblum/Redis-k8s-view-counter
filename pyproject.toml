@@ -18,6 +18,15 @@ dependencies = [
 redis-k8s-view-counter = "redis_k8s_view_counter:main"
 view-counter-worker = "redis_k8s_view_counter.drain_worker:main"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
 [build-system]
 requires = ["uv_build>=0.12.15,<0.13.0"]
 build-backend = "uv_build"
