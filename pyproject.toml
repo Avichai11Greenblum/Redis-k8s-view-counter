@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 redis-k8s-view-counter = "redis_k8s_view_counter:main"
+view-counter-worker = "redis_k8s_view_counter.worker:main"
 
 [build-system]
 requires = ["uv_build>=0.12.15,<0.13.0"]
