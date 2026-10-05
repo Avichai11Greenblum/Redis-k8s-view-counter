@@ -1,0 +1,61 @@
+# Headless Service (clusterIP: None): gives the StatefulSet's pod a stable
+# DNS name ("redis") instead of a load-balanced virtual IP — the normal
+# pairing for a StatefulSet, and what REDIS_URL in the ConfigMap points at.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+spec:
+  clusterIP: None
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+# StatefulSet, not Deployment: Redis needs the SAME persistent volume back
+# every time its pod restarts (that's what makes the AOF file durable across
+# a pod recreation) — volumeClaimTemplates below gives each replica its own
+# stable PVC, which a Deployment doesn't provide.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7
+          command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+          ports:
+            - containerPort: 6379
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

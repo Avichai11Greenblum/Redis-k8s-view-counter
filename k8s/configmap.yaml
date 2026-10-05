@@ -1,0 +1,10 @@
+# Non-secret settings, shared by whichever pods need them (envFrom).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: view-counter-config
+data:
+  REDIS_URL: "redis://redis:6379/0"
+  DRAIN_INTERVAL_SECONDS: "5"
+  POSTGRES_USER: "views"
+  POSTGRES_DB: "views"

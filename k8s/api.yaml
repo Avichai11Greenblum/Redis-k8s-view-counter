@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: view-counter-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: view-counter-api
+  template:
+    metadata:
+      labels:
+        app: view-counter-api
+    spec:
+      containers:
+        - name: api
+          image: view-counter:dev
+          # Never: this image was built locally and loaded via `minikube
+          # image load`, not pushed anywhere — Never stops Kubernetes from
+          # trying (and failing) to pull it from a registry.
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: view-counter-config
+            - secretRef:
+                name: view-counter-secret
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+# NodePort, not ClusterIP: makes this reachable from outside the cluster
+# (via `minikube service`) for manual testing — ClusterIP would only be
+# reachable from other pods inside the cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: view-counter-api
+spec:
+  type: NodePort
+  selector:
+    app: view-counter-api
+  ports:
+    - port: 8000
+      targetPort: 8000

@@ -10,7 +10,7 @@ behind the write path by up to one drain interval.
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, status
+from fastapi import FastAPI, Response, status
 
 from .db import get_db_pool, get_view_buckets, increment_direct, init_tables
 from .redis_store import get_redis_client, increment_view, truncate_to_bucket
@@ -38,6 +38,35 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/healthz")
+async def healthz():
+    """Liveness probe: is this process alive at all?
+
+    Deliberately checks nothing external. If this depended on Redis/Postgres,
+    a downstream outage would make Kubernetes kill and restart this pod
+    repeatedly — restarting a healthy process can't fix a dead database, so
+    that's just a restart loop. Liveness only answers "is the process itself
+    stuck", not "are its dependencies up" — that's readiness's job below.
+    """
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+async def readyz(response: Response):
+    """Readiness probe: can this pod handle traffic right now?
+
+    Pings Redis — every write goes through it, so if Redis is unreachable
+    this pod can't do its job. On failure, Kubernetes stops routing traffic
+    here (without restarting the pod) until a later check succeeds again.
+    """
+    try:
+        await app.state.redis.ping()
+    except Exception:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "redis unreachable"}
+    return {"status": "ok"}
 
 
 @app.post("/views", status_code=status.HTTP_202_ACCEPTED)
