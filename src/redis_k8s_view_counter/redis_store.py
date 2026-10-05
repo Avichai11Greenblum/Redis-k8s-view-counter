@@ -40,6 +40,17 @@ def _parse_bucket_str(bucket_str: str) -> datetime:
     return datetime.strptime(bucket_str, BUCKET_FORMAT).replace(tzinfo=timezone.utc)
 
 
+def truncate_to_bucket(now: datetime) -> datetime:
+    """Round a datetime down to its minute-bucket boundary (drop seconds/µs).
+
+    Used by the direct-write benchmark path (stage 5) so its rows land on
+    the exact same (resource_id, bucket_start) a buffered+drained write
+    would use — otherwise every call would get its own unique timestamp and
+    never collide, which would make the hot-key comparison meaningless.
+    """
+    return _parse_bucket_str(f"{now:{BUCKET_FORMAT}}")
+
+
 def get_redis_client() -> Redis:
     """Build a new Redis client from REDIS_URL."""
     return Redis.from_url(REDIS_URL, decode_responses=True)
