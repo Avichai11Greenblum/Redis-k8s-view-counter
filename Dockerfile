@@ -13,8 +13,11 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-install-project --no-dev
 
-# Now the actual source, and install the project itself on top.
+# Now the actual source, and install the project itself on top. README.md
+# is needed too — pyproject.toml declares it as the package's readme, and
+# the build backend refuses to build without the file it points to existing.
 COPY src ./src
+COPY README.md ./
 RUN uv sync --locked --no-dev
 
 # ---- final: just the venv + source, no uv, no build cache, no dev deps ----
