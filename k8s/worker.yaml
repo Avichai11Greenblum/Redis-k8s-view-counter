@@ -1,0 +1,30 @@
+# No Service here — the worker isn't reachable over the network, it just
+# polls Redis/Postgres on its own, so there's nothing for a Service to
+# route traffic to. No HTTP probes either, for the same reason: it has no
+# HTTP server to check. Kubernetes still restarts it on a crash regardless
+# of probes — that's unconditional container-level behavior, not something
+# a probe enables.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: view-counter-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: view-counter-worker
+  template:
+    metadata:
+      labels:
+        app: view-counter-worker
+    spec:
+      containers:
+        - name: worker
+          image: view-counter:dev
+          imagePullPolicy: Never
+          command: ["view-counter-worker"]
+          envFrom:
+            - configMapRef:
+                name: view-counter-config
+            - secretRef:
+                name: view-counter-secret
