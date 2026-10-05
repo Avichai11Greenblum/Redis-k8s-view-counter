@@ -50,8 +50,15 @@ def get_db_pool() -> AsyncConnectionPool:
 
     `open=False` because pool setup needs an event loop, which doesn't exist
     yet at import time — we open it explicitly during FastAPI's lifespan.
+
+    min_size/max_size are explicit because psycopg_pool's own default
+    (min_size=4, max_size=None i.e. max_size=min_size) is a FIXED pool of
+    just 4 connections — found the hard way, benchmarking stage 5: it
+    queued concurrent requests behind only 4 connections regardless of
+    traffic, which looks identical to real row-lock contention in a graph
+    but isn't the same thing.
     """
-    return AsyncConnectionPool(DATABASE_URL, open=False)
+    return AsyncConnectionPool(DATABASE_URL, open=False, min_size=4, max_size=50)
 
 
 async def init_tables(pool: AsyncConnectionPool) -> None:
@@ -86,6 +93,19 @@ async def apply_batch(
 
             await conn.execute(UPSERT_VIEW_COUNT_SQL, (resource_id, bucket_start, count))
             return True
+
+
+async def increment_direct(pool: AsyncConnectionPool, resource_id: str, bucket_start: datetime) -> None:
+    """Write straight to Postgres, one row-locking UPSERT per view.
+
+    This is the comparison baseline for the stage 5 benchmark: the write
+    path WITHOUT the Redis buffer. Every call takes Postgres's row lock on
+    (resource_id, bucket_start) for the life of its own transaction, so
+    concurrent calls on the same hot key serialize behind each other —
+    exactly the contention the buffer exists to avoid.
+    """
+    async with pool.connection() as conn:
+        await conn.execute(UPSERT_VIEW_COUNT_SQL, (resource_id, bucket_start, 1))
 
 
 async def get_view_buckets(

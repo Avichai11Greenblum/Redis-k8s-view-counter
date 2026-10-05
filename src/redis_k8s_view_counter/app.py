@@ -12,8 +12,8 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, status
 
-from .db import get_db_pool, get_view_buckets, init_tables
-from .redis_store import get_redis_client, increment_view
+from .db import get_db_pool, get_view_buckets, increment_direct, init_tables
+from .redis_store import get_redis_client, increment_view, truncate_to_bucket
 from .schemas import EventView, ViewBucket, ViewsResponse
 
 
@@ -50,6 +50,18 @@ async def record_view(event: EventView):
     """
     key = await increment_view(app.state.redis, event.resource_id)
     return {"key": key}
+
+
+@app.post("/views/direct", status_code=status.HTTP_202_ACCEPTED)
+async def record_view_direct(event: EventView):
+    """Benchmark-only (stage 5): write straight to Postgres, no Redis buffer.
+
+    Exists purely as the "without the buffer" comparison point — not part of
+    the real write path, and not something a production caller should use.
+    """
+    bucket_start = truncate_to_bucket(datetime.now(timezone.utc))
+    await increment_direct(app.state.db_pool, event.resource_id, bucket_start)
+    return {"resource_id": event.resource_id, "bucket_start": bucket_start}
 
 
 @app.get("/views/{resource_id}", response_model=ViewsResponse)
